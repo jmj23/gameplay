@@ -1,5 +1,6 @@
 import logging
 import time
+import sys
 
 import cv2
 import keras
@@ -9,7 +10,7 @@ import tensorflow as tf
 from keras.optimizers import SGD
 from PIL import Image, ImageGrab, ImageOps
 
-from directKeys import A, D, DetectClick, PressKey, S, W, click, moveMouseTo
+from directKeys import A, D, DetectClick, PressKey, S, W, click, moveMouseTo, getMousePosition
 from Qmodels import BlockModel
 
 
@@ -18,15 +19,32 @@ def huber_loss(y_true, y_pred):
 
 
 class Play2048:
-    def __init__(self, logger, learning_rate=0.1, discount=0.95, exploration_rate=1.0, iterations=10000, resume=False):
+    def __init__(self, logger,
+                 learning_rate=0.0005,
+                 discount=0.95,
+                 exploration_rate=1.0,
+                 iterations=10000,
+                 mode='training',
+                 resume=False):
+        # Setup logger
+        self.logger = logger
+        self.logger.info('Initializing agent...')
+
+        # Parse aguments
         self.learning_rate = learning_rate
         self.discount = discount  # How much we appreciate future reward over current
         self.exploration_rate = 1.0  # Initial exploration rate
-        # Shift from exploration to explotation
+
+        # Setup shift from exploration to explotation
         self.exploration_delta = 1.0 / iterations
         self.max_iterations = iterations
-        self.logger = logger
-        self.logger.info('Initializing agent...')
+
+        if mode.lower() == 'training':
+            self.training_mode = True
+            self.logger.info('Agent in training mode')
+        else:
+            self.training_mode = False
+            self.logger.info('Agent in game play mode')
 
         # possible moves
         self.moves = [W, A, S, D]
@@ -42,7 +60,7 @@ class Play2048:
         # some window coordinates
         self.replay_coords = [1920, 1325]
         self.restart_coords = [[2155, 1765], [2002, 1656]]
-        self.mmouse_coords = [763, 26]
+        self.mmouse_coords = getMousePosition()
         self.select_coords = [2045, 37]
         self.board_coords = [1471, 400, 2707, 1640]
         self.score_coords = [1824, 202, 1995, 245]
@@ -58,25 +76,28 @@ class Play2048:
 
         # build model
         self.build_model()
-        if resume:
+        if resume or not self.training_mode:
             self.model.load_weights(self.weights_path)
 
         self.logger.info('Agent initialized')
 
     def replay_click(self):
         click(self.replay_coords[0], self.replay_coords[1])
+        self.move_mouse()
 
     def restart_click(self):
         click(self.restart_coords[0][0], self.restart_coords[0][1])
         time.sleep(.2)
         click(self.restart_coords[1][0], self.restart_coords[1][1])
         time.sleep(.2)
+        self.move_mouse()
 
     def window_click(self):
         click(self.select_coords[0], self.select_coords[1])
+        self.move_mouse()
 
     def move_mouse(self):
-        moveMouseTo(self.mmouse_coords[0], self.mmoues_coords[1])
+        moveMouseTo(self.mmouse_coords[0], self.mmouse_coords[1])
 
     def get_board(self):
         coords = self.board_coords
@@ -92,7 +113,8 @@ class Play2048:
                                    coords[1],
                                    coords[2],
                                    coords[3]))
-        img_inv = ImageOps.invert(img)
+        img_inv = ImageOps.invert(img).convert('L')
+        bw = img_inv.point(lambda x: 0 if x < 100 else 255, '1')
         # check for game over
         array = np.array(img_inv)
         if array.mean() < 60:
@@ -100,7 +122,7 @@ class Play2048:
             self.game_over = True
             return None
         config_str = '--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789'
-        score = pytesseract.image_to_string(img_inv,
+        score = pytesseract.image_to_string(bw,
                                             config=config_str)
         self.logger.info('Got score "{}"'.format(score))
         try:
@@ -132,12 +154,15 @@ class Play2048:
         return q_pred
 
     def get_next_action(self, state):
-        if np.random.rand() > self.exploration_rate:  # Explore (gamble) or exploit (greedy)
-            self.logger.info('Using model action')
-            action = self.greedy_action(state)
+        if self.training_mode:
+            if np.random.rand() > self.exploration_rate:  # Explore (gamble) or exploit (greedy)
+                self.logger.info('Using model action')
+                action = self.greedy_action(state)
+            else:
+                self.logger.info('Using random action')
+                action = self.random_action()
         else:
-            self.logger.info('Using random action')
-            action = self.random_action()
+            action = self.greedy_action(state)
         return action
 
     # Which action has bigger Q-value, estimated by our model (inference).
@@ -167,13 +192,15 @@ class Play2048:
     def train(self, old_state, action, reward, new_state):
         # Ask the model for the Q values of the old state (inference)
         old_state_Q_values = self.get_Q(old_state)
-
+        self.logger.debug('Old Q values: {}'.format(str(old_state_Q_values)))
         # Ask the model for the Q values of the new state (inference)
         new_state_Q_values = self.get_Q(new_state)
+        self.logger.debug('New Q values: {}'.format(str(new_state_Q_values)))
 
         # Real Q value for the action we took. This is what we will train towards.
-        old_state_Q_values[action] = reward + \
-            self.discount * np.amax(new_state_Q_values)
+        realQ = reward + self.discount * np.amax(new_state_Q_values)
+        old_state_Q_values[action] = realQ
+        self.logger.debug('Real Q value: {}'.format(realQ))
 
         # Setup training data
         target = old_state_Q_values[np.newaxis, ...]
@@ -186,43 +213,47 @@ class Play2048:
         action = self.get_next_action(self.old_state)
         # make move
         self.take_action(action)
-        # get new state
-        new_state = self.get_state()
         # get new score
         new_score = self.get_score()
         # check for game over or error
         if new_score is None:
             self.logger.info('Ending game...')
             return
-        # calculate reward
-        reward = new_score - self.score
-        # make reward negative if score not increased
-        if reward == 0:
-            reward = -10
-        # Train our model with new data
-        self.train(self.old_state, action, reward, new_state)
+        if self.training_mode:
+            # get new state
+            new_state = self.get_state()
+            # calculate reward
+            reward = new_score - self.score
+            # make reward negative if score not increased
+            if reward == 0:
+                reward = -10
+            self.logger.info('Reward is {}'.format(reward))
+            # Train our model with new data
+            self.train(self.old_state, action, reward, new_state)
+            # Shift exploration_rate toward zero (less random)
+            if self.exploration_rate > 0:
+                self.exploration_rate -= self.exploration_delta
 
         # update old state and score
         self.old_state = new_state
         self.score = new_score
 
-        # Shift exploration_rate toward zero (less random)
-        if self.exploration_rate > 0:
-            self.exploration_rate -= self.exploration_delta
-
     def start_game(self):
         self.score = 0
         self.game_over = False
+        self.error_restart = False
+        # Start countdown
+        self.countdown(3)
         # Get starting state
         self.old_state = self.get_state()
 
         while not self.game_over and not self.error_restart:
             self.take_turn()
             self.counter += 1
-            if counter == self.max_iterations:
+            if self.counter == self.max_iterations and self.training_mode:
                 self.logger.info('Max iterations reached! Ending game.')
                 self.game_over = True
-            if counter % 50 == 0:
+            if self.counter % 50 == 0:
                 self.logger.info(
                     'Saving model weights at iteration {}/{}'.format(self.counter, self.max_iterations))
                 self.model.save_weights(self.weights_path)
@@ -231,8 +262,12 @@ class Play2048:
         if self.error_restart:
             self.restart()
         # If stopped because game over but still iterations left
-        if counter < self.max_iterations:
+        if self.counter < self.max_iterations and self.training_mode:
             self.replay()
+        # If stopped because game ende3d
+        if not self.training_mode and self.game_over:
+            self.logger.info('Game over')
+            self.logger.info('Final score: {}'.format(self.score))
 
     def replay(self):
         self.logger.info('Starting new game...')
@@ -253,25 +288,27 @@ class Play2048:
 
 if __name__ == '__main__':
     # setup logging
-    logFormat = "%(levelname)s [%(name)s.%(funcName)s:%(lineno)d]:%(message)s"
-    logging.basicConfig(level=logging.DEBUG, format=logFormat)
+    
+    # logging.basicConfig(level=logging.DEBUG, format=formatter1)
     logger = logging.getLogger('Play2048')
+    logger.setLevel(logging.DEBUG)
     # make file handler
     fh = logging.FileHandler('Play2048.log')
-    formatter = "%(levelname)s %(asctime)s [%(name)s.%(funcName)s:%(lineno)d]:%(message)s"
+    formatter1 = logging.Formatter("%(levelname)s %(asctime)s [%(name)s.%(funcName)s:%(lineno)d]:%(message)s")
     fh.setLevel(logging.DEBUG)
-    fh.setFormatter(formatter)
+    fh.setFormatter(formatter1)
     # make console handler
     ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
+    ch.setLevel(logging.INFO)
+    formatter2 = logging.Formatter("%(levelname)s [%(name)s.%(funcName)s:%(lineno)d]:%(message)s")
+    ch.setFormatter(formatter2)
     # add the handlers to the logger
     logger.addHandler(fh)
     logger.addHandler(ch)
 
     # Create agent
-    agent = Play2048(logger, iterations=1000, resume=True)
-    # Start countdown
-    agent.countdown(3)
-
+    agent = Play2048(logger, iterations=10000, mode='training', resume=False)
+    # agent = Play2048(logger, mode='game')
+    
     # Start playing
-    agent.start_game()
+    agent.restart()
