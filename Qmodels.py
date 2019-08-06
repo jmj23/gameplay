@@ -58,5 +58,6 @@ def BlockModel(input_shape, out_chan,filt_num=8, numBlocks=3):
 
     return Model(lay_input, lay_out)
 
-testModel = BlockModel((256,256,1),4)
-testModel.summary()
+if __name__ == '__main__':
+    testModel = BlockModel((256,256,1),4)
+    testModel.summary()
